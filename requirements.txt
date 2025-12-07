@@ -1,0 +1,7 @@
+streamlit==1.32.0
+pandas==2.2.1
+xlsxwriter==3.2.0
+openpyxl==3.1.2
+xlrd==2.0.1
+sqlalchemy==2.0.28
+psycopg2-binary==2.9.9

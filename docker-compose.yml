@@ -1,0 +1,37 @@
+version: '3.8'
+
+services:
+  # SERVIÇO 1: O BANCO DE DADOS (PostgreSQL)
+  db:
+    image: postgres:15
+    container_name: pmp_postgres
+    restart: always
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: senha_forte_123
+      POSTGRES_DB: sistema_pmp
+    volumes:
+      - pg_data:/var/lib/postgresql/data # Salva os dados aqui
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d sistema_pmp"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # SERVIÇO 2: A APLICAÇÃO (Streamlit)
+  app:
+    container_name: facilitador_pmp
+    build: .
+    restart: always
+    ports:
+      - "8501:8501"
+    environment:
+      # Conecta no serviço 'db' usando as credenciais acima
+      - DATABASE_URL=postgresql://admin:senha_forte_123@db:5432/sistema_pmp
+      - TZ=America/Sao_Paulo
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pg_data:
