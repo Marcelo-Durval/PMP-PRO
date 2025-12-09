@@ -41,6 +41,10 @@ class Pedido(Base):
     data_pedido = Column(String)
     status = Column(String) 
     criado_em = Column(DateTime, default=datetime.now)
+    # COLUNAS PARA MÉTRICA DE TEMPO
+    data_entrada_conferencia = Column(DateTime, nullable=True)
+    data_conclusao = Column(DateTime, nullable=True)
+    
     itens = relationship("ItemPedido", back_populates="pedido", cascade="all, delete")
     logs = relationship("LogTempo", back_populates="pedido", cascade="all, delete")
 
@@ -59,7 +63,7 @@ class Separacao(Base):
     __tablename__ = 'separacoes'
     id = Column(Integer, primary_key=True)
     item_id = Column(Integer, ForeignKey('itens_pedido.id'))
-    lote = Column(String)
+    rastreabilidade = Column(String)
     qtd_separada = Column(Float)
     separador_id = Column(Integer, ForeignKey('usuarios.id'))
     registrado_em = Column(DateTime, default=datetime.now)
@@ -139,6 +143,7 @@ def calcular_tempos_reais(session, pedido_id):
     return tempos, status_atual
 
 def formatar_delta(delta):
+    if not delta: return "00:00:00"
     total_seconds = int(delta.total_seconds())
     hours, remainder = divmod(total_seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
@@ -261,17 +266,47 @@ def adm_screen():
             if ped:
                 st.markdown(f"### 🔎 {ped.numero_pedido}")
                 
+                # --- CÁLCULOS DE TEMPO PARA EXIBIÇÃO ---
+                
+                # 1. Tempo de Validação (Gap entre Operador Entregar e ADM Aprovar)
+                tempo_validacao_str = "00:00:00"
+                if ped.data_entrada_conferencia and ped.data_conclusao:
+                    delta_adm = ped.data_conclusao - ped.data_entrada_conferencia
+                    # Se der negativo (bug de timezone), zera
+                    if delta_adm.total_seconds() < 0: delta_adm = timedelta(0)
+                    tempo_validacao_str = formatar_delta(delta_adm)
+                
+                # 2. Tempo Operacional (Chão de Fábrica)
+                tempos_individuais, status_live = calcular_tempos_reais(s, ped.id)
+                tempo_total_equipe = sum(tempos_individuais.values(), timedelta(0))
+                tempo_equipe_str = formatar_delta(tempo_total_equipe)
+
+                # 3. Lead Time Total (Do momento que foi criado/importado até conclusão)
+                tempo_ciclo_total = "00:00:00"
+                if ped.status == 'CONCLUIDO' and ped.criado_em and ped.data_conclusao:
+                     delta_ciclo = ped.data_conclusao - ped.criado_em
+                     tempo_ciclo_total = formatar_delta(delta_ciclo)
+
                 if ped.status in ['EM_SEPARACAO', 'EM_CONFERENCIA', 'CONCLUIDO']:
-                    with st.expander("⏱️ Performance & Status da Equipe", expanded=True):
-                        tempos, status_live = calcular_tempos_reais(s, ped.id)
-                        cols = st.columns(len(tempos)) if len(tempos) > 0 else [st.container()]
+                    with st.expander("⏱️ Métricas de Tempo", expanded=True):
+                        # DISPLAY DE MÉTRICAS (MUDANÇA DE LAYOUT)
+                        k1, k2, k3 = st.columns(3)
+                        k1.metric("👷 Tempo Operacional", tempo_equipe_str, help="Soma dos relógios de todos operadores")
+                        k2.metric("🛡️ Tempo em Validação", tempo_validacao_str, help="Tempo que ficou aguardando + conferência do ADM")
+                        if ped.status == 'CONCLUIDO':
+                            k3.metric("🚀 Lead Time Total", tempo_ciclo_total, help="Tempo desde a importação até a conclusão")
+                        
+                        st.divider()
+                        # Detalhe por operador
+                        st.caption("Detalhe por Operador:")
+                        cols = st.columns(len(tempos_individuais)) if len(tempos_individuais) > 0 else [st.container()]
                         idx = 0
-                        for uid, delta in tempos.items():
-                            with cols[idx % 4] if len(tempos) > 0 else cols[0]:
+                        for uid, delta in tempos_individuais.items():
+                            with cols[idx % 4] if len(tempos_individuais) > 0 else cols[0]:
                                 unome = s.query(Usuario).get(uid).username
                                 stt = status_live.get(uid, 'PARADO')
                                 icon_stt = "🟢" if stt == 'RODANDO' else "⏸️" if stt == 'PARADO' else "🏁"
-                                st.metric(label=f"{icon_stt} {unome}", value=formatar_delta(delta))
+                                st.text(f"{icon_stt} {unome}: {formatar_delta(delta)}")
                             idx += 1
 
                 for it in ped.itens:
@@ -284,27 +319,71 @@ def adm_screen():
                     with st.expander(f":{color}[{icon} - {it.codigo} {it.descricao}] ({tot} / {meta})"):
                         for sep in it.separacoes:
                             c1, c2, c3, c4 = st.columns([3, 2, 2, 1])
-                            c1.text(sep.lote); c2.text(sep.qtd_separada); c3.caption(s.query(Usuario).get(sep.separador_id).username)
+                            c1.text(sep.rastreabilidade)
+                            c2.text(sep.qtd_separada)
+                            c3.caption(s.query(Usuario).get(sep.separador_id).username)
                             if c4.button("🗑️", key=f"da{sep.id}"): s.delete(sep); s.commit(); st.rerun()
                         
                         if ped.status != 'CONCLUIDO':
                             st.markdown("---")
                             ca, cb, cc = st.columns([2,1,1])
-                            nl = ca.text_input("Lote", key=f"al{it.id}"); nq = cb.number_input("Qtd", step=0.1, key=f"aq{it.id}")
+                            nl = ca.text_input("Rastreabilidade", key=f"al{it.id}")
+                            nq = cb.number_input("Qtd", step=0.1, key=f"aq{it.id}")
                             if cc.button("Salvar", key=f"ab{it.id}"):
-                                if nl and nq > 0: s.add(Separacao(item_id=it.id, lote=nl, qtd_separada=nq, separador_id=st.session_state['user'].id)); s.commit(); st.rerun()
+                                if nl and nq > 0: 
+                                    s.add(Separacao(item_id=it.id, rastreabilidade=nl, qtd_separada=nq, separador_id=st.session_state['user'].id))
+                                    s.commit(); st.rerun()
 
                 st.markdown("### Ações")
                 if ped.status == 'CONCLUIDO':
                     cd, cdel = st.columns([3,1])
-                    data = [{"Cod": i.codigo, "Desc": i.descricao, "Meta": i.qtd_solicitada, "Real": sum([s.qtd_separada for s in i.separacoes]), "Lotes": " | ".join([f"{s.lote}({s.qtd_separada})" for s in i.separacoes])} for i in ped.itens]
                     
-                    # CORREÇÃO DE SINTAXE DO EXCEL AQUI
+                    # --- GERAÇÃO DO EXCEL DETALHADO ---
+                    data = []
+                    for i in ped.itens:
+                        if not i.separacoes:
+                            data.append({
+                                "Cod": i.codigo, 
+                                "Desc": i.descricao, 
+                                "Meta": i.qtd_solicitada, 
+                                "Qtd": 0,
+                                "Rastreabilidade": "",
+                                "Operador": "N/A",
+                                "Tempo Operador": "00:00:00",
+                                "Tempo Equipe": tempo_equipe_str,
+                                "Tempo Validação": tempo_validacao_str,
+                                "Lead Time Total": tempo_ciclo_total
+                            })
+                        else:
+                            for sep in i.separacoes:
+                                nome_op = "N/A"
+                                tempo_op_individual = "00:00:00"
+                                try:
+                                    u_obj = s.query(Usuario).get(sep.separador_id)
+                                    nome_op = u_obj.username
+                                    tempo_op_individual = formatar_delta(tempos_individuais.get(u_obj.id, timedelta(0)))
+                                except: pass
+                                
+                                data.append({
+                                    "Cod": i.codigo, 
+                                    "Desc": i.descricao, 
+                                    "Meta": i.qtd_solicitada, 
+                                    "Qtd": sep.qtd_separada,
+                                    "Rastreabilidade": sep.rastreabilidade,
+                                    "Operador": nome_op,
+                                    "Tempo Operador": tempo_op_individual,
+                                    "Tempo Equipe": tempo_equipe_str,
+                                    "Tempo Validação": tempo_validacao_str,
+                                    "Lead Time Total": tempo_ciclo_total
+                                })
+
                     out = io.BytesIO()
                     with pd.ExcelWriter(out, engine='xlsxwriter') as w: 
                         pd.DataFrame(data).to_excel(w, index=False)
+                        worksheet = w.sheets['Sheet1']
+                        worksheet.set_column(0, 10, 15) 
                     
-                    cd.download_button("⬇️ Excel", out, f"BAIXA_{ped.numero_pedido}.xlsx", use_container_width=True)
+                    cd.download_button("⬇️ Excel Detalhado", out, f"BAIXA_{ped.numero_pedido}.xlsx", use_container_width=True)
                     
                     if cdel.button("🗑️ APAGAR", type="primary", use_container_width=True):
                         s.delete(ped)
@@ -314,7 +393,11 @@ def adm_screen():
                 else:
                     c1, c2 = st.columns(2)
                     if c1.button("❌ Devolver"): ped.status = "CORRECAO"; s.commit(); st.rerun()
-                    if c2.button("✅ Aprovar"): encerrar_cronometros_abertos(s, ped.id); ped.status = "CONCLUIDO"; s.commit(); st.rerun()
+                    if c2.button("✅ Aprovar"): 
+                        encerrar_cronometros_abertos(s, ped.id)
+                        ped.status = "CONCLUIDO"
+                        ped.data_conclusao = datetime.now()
+                        s.commit(); st.rerun()
 
     # 4. USERS
     with t4:
@@ -388,18 +471,25 @@ def op_screen():
                     st.markdown("**Registros:**")
                     for sep in it.separacoes:
                         c1, c2, c3 = st.columns([4, 2, 1])
-                        c1.text(sep.lote); c2.text(sep.qtd_separada)
+                        c1.text(sep.rastreabilidade)
+                        c2.text(sep.qtd_separada)
                         if c3.button("🗑️", key=f"del_op_{sep.id}", disabled=disabled): s.delete(sep); s.commit(); st.rerun()
                 st.markdown("---")
                 c1, c2, c3 = st.columns([2,1,1])
-                nl = c1.text_input("Lote", key=f"l{it.id}", disabled=disabled); nq = c2.number_input("Qtd", step=0.1, key=f"q{it.id}", disabled=disabled)
+                nl = c1.text_input("Rastreabilidade", key=f"l{it.id}", disabled=disabled)
+                nq = c2.number_input("Qtd", step=0.1, key=f"q{it.id}", disabled=disabled)
                 if nq>0 and (done+nq>meta): st.warning(f"⚠️ Total será {done+nq:.2f}!")
                 if c3.button("Add", key=f"b{it.id}", disabled=disabled):
-                    if nl and nq>0: s.add(Separacao(item_id=it.id, lote=nl, qtd_separada=nq, separador_id=u.id)); s.commit(); st.rerun()
+                    if nl and nq>0: 
+                        s.add(Separacao(item_id=it.id, rastreabilidade=nl, qtd_separada=nq, separador_id=u.id))
+                        s.commit(); st.rerun()
         st.divider()
         if st.button("🏁 FINALIZAR E ENVIAR", type="primary"):
             encerrar_cronometros_abertos(s, ped.id)
             ped.status = "EM_CONFERENCIA"
+            # CORREÇÃO: Só seta a data se ela ainda não existir
+            if not ped.data_entrada_conferencia:
+                ped.data_entrada_conferencia = datetime.now()
             s.commit(); st.success("Enviado!"); time.sleep(1); st.rerun()
 
 # --- MAIN ---
