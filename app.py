@@ -41,7 +41,6 @@ class Pedido(Base):
     data_pedido = Column(String)
     status = Column(String) 
     criado_em = Column(DateTime, default=datetime.now)
-    # COLUNAS PARA MÉTRICA DE TEMPO
     data_entrada_conferencia = Column(DateTime, nullable=True)
     data_conclusao = Column(DateTime, nullable=True)
     
@@ -219,25 +218,79 @@ def adm_screen():
                     s.commit(); st.success(f"Pedido {num} na Validação!")
             else: st.error("Erro leitura")
 
-    # 2. VALIDACAO
+    # 2. VALIDACAO (LÓGICA CORRIGIDA)
     with t2:
         validacoes = s.query(Pedido).filter(Pedido.status == 'VALIDACAO').all()
         if not validacoes: st.caption("Vazio.")
         else:
             pid = st.selectbox("Limpar:", [p.id for p in validacoes], format_func=lambda x: next((f"{p.numero_pedido}" for p in validacoes if p.id==x), x))
             pval = s.query(Pedido).get(pid)
+            
+            # Carrega dados
             dval = pd.DataFrame([{"ID": i.id, "Código": i.codigo, "Descrição": i.descricao, "Qtd": i.qtd_solicitada, "Manter?": True} for i in pval.itens])
             
             st.markdown(f"**Validando: {pval.numero_pedido}**")
-            edf = st.data_editor(dval, num_rows="dynamic", column_config={"ID": st.column_config.NumberColumn(disabled=True)}, hide_index=True, key="ev")
+            st.info("💡 Dica: Desmarque 'Manter?' para excluir. Adicione linhas no final da tabela para novos itens.")
+            
+            # Data Editor permite adicionar linhas (num_rows="dynamic")
+            edf = st.data_editor(dval, num_rows="dynamic", column_config={
+                "ID": st.column_config.NumberColumn(disabled=True),
+                "Código": st.column_config.TextColumn(required=True),
+                "Descrição": st.column_config.TextColumn(required=True),
+                "Qtd": st.column_config.NumberColumn(required=True, min_value=0.01),
+                "Manter?": st.column_config.CheckboxColumn(default=True)
+            }, hide_index=True, key="ev")
             
             ca, cb = st.columns(2)
-            if ca.button("🗑️ Excluir Pedido"): s.delete(pval); s.commit(); st.rerun()
+            if ca.button("🗑️ Excluir Pedido Completo"): s.delete(pval); s.commit(); st.rerun()
+            
             if cb.button("🚀 Liberar"):
-                ids = edf["ID"].tolist()
-                for di in pval.itens:
-                    if di.id not in ids: s.delete(di)
-                pval.status = "PENDENTE"; s.commit(); st.success("Liberado!"); time.sleep(1); st.rerun()
+                # 1. Identificar IDs que existem no banco hoje
+                itens_banco = {i.id: i for i in pval.itens}
+                ids_para_manter = []
+
+                # 2. Processar o DataFrame editado
+                for index, row in edf.iterrows():
+                    # Se desmarcou "Manter?", ignora essa linha (ela será excluída do banco depois)
+                    if not row.get("Manter?", True):
+                        continue
+
+                    row_id = row.get("ID")
+                    
+                    # Verifica se é uma linha NOVA (ID vazio ou NaN)
+                    if pd.isna(row_id) or row_id is None or str(row_id).strip() == "":
+                        # CRIA NOVO ITEM
+                        novo_item = ItemPedido(
+                            pedido_id=pval.id,
+                            codigo=str(row["Código"]),
+                            descricao=str(row["Descrição"]),
+                            unidade="UN", # Padrão
+                            qtd_solicitada=float(row["Qtd"])
+                        )
+                        s.add(novo_item)
+                    else:
+                        # ITEM JÁ EXISTE: Atualiza e guarda o ID para não apagar
+                        try:
+                            id_int = int(row_id)
+                            item_existente = itens_banco.get(id_int)
+                            if item_existente:
+                                item_existente.codigo = str(row["Código"])
+                                item_existente.descricao = str(row["Descrição"])
+                                item_existente.qtd_solicitada = float(row["Qtd"])
+                                ids_para_manter.append(id_int)
+                        except: pass
+
+                # 3. Apagar do banco o que não está na lista de "manter"
+                for db_id, db_item in itens_banco.items():
+                    if db_id not in ids_para_manter:
+                        s.delete(db_item)
+
+                # 4. Finaliza
+                pval.status = "PENDENTE"
+                s.commit()
+                st.success("Liberado com sucesso!")
+                time.sleep(1)
+                st.rerun()
 
     # 3. KANBAN
     with t3:
@@ -268,20 +321,19 @@ def adm_screen():
                 
                 # --- CÁLCULOS DE TEMPO PARA EXIBIÇÃO ---
                 
-                # 1. Tempo de Validação (Gap entre Operador Entregar e ADM Aprovar)
+                # 1. Tempo de Validação
                 tempo_validacao_str = "00:00:00"
                 if ped.data_entrada_conferencia and ped.data_conclusao:
                     delta_adm = ped.data_conclusao - ped.data_entrada_conferencia
-                    # Se der negativo (bug de timezone), zera
                     if delta_adm.total_seconds() < 0: delta_adm = timedelta(0)
                     tempo_validacao_str = formatar_delta(delta_adm)
                 
-                # 2. Tempo Operacional (Chão de Fábrica)
+                # 2. Tempo Operacional
                 tempos_individuais, status_live = calcular_tempos_reais(s, ped.id)
                 tempo_total_equipe = sum(tempos_individuais.values(), timedelta(0))
                 tempo_equipe_str = formatar_delta(tempo_total_equipe)
 
-                # 3. Lead Time Total (Do momento que foi criado/importado até conclusão)
+                # 3. Lead Time Total
                 tempo_ciclo_total = "00:00:00"
                 if ped.status == 'CONCLUIDO' and ped.criado_em and ped.data_conclusao:
                      delta_ciclo = ped.data_conclusao - ped.criado_em
@@ -289,7 +341,6 @@ def adm_screen():
 
                 if ped.status in ['EM_SEPARACAO', 'EM_CONFERENCIA', 'CONCLUIDO']:
                     with st.expander("⏱️ Métricas de Tempo", expanded=True):
-                        # DISPLAY DE MÉTRICAS (MUDANÇA DE LAYOUT)
                         k1, k2, k3 = st.columns(3)
                         k1.metric("👷 Tempo Operacional", tempo_equipe_str, help="Soma dos relógios de todos operadores")
                         k2.metric("🛡️ Tempo em Validação", tempo_validacao_str, help="Tempo que ficou aguardando + conferência do ADM")
@@ -297,7 +348,6 @@ def adm_screen():
                             k3.metric("🚀 Lead Time Total", tempo_ciclo_total, help="Tempo desde a importação até a conclusão")
                         
                         st.divider()
-                        # Detalhe por operador
                         st.caption("Detalhe por Operador:")
                         cols = st.columns(len(tempos_individuais)) if len(tempos_individuais) > 0 else [st.container()]
                         idx = 0
@@ -338,7 +388,6 @@ def adm_screen():
                 if ped.status == 'CONCLUIDO':
                     cd, cdel = st.columns([3,1])
                     
-                    # --- GERAÇÃO DO EXCEL DETALHADO ---
                     data = []
                     for i in ped.itens:
                         if not i.separacoes:
@@ -487,7 +536,6 @@ def op_screen():
         if st.button("🏁 FINALIZAR E ENVIAR", type="primary"):
             encerrar_cronometros_abertos(s, ped.id)
             ped.status = "EM_CONFERENCIA"
-            # CORREÇÃO: Só seta a data se ela ainda não existir
             if not ped.data_entrada_conferencia:
                 ped.data_entrada_conferencia = datetime.now()
             s.commit(); st.success("Enviado!"); time.sleep(1); st.rerun()
