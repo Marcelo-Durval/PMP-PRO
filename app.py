@@ -4,13 +4,17 @@ import re
 import io
 import time
 import os
+import cv2
+import numpy as np
+import zxingcpp
 from datetime import datetime, timedelta
 from sqlalchemy import create_engine, Column, Integer, String, Float, ForeignKey, DateTime, Boolean, Text
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.sql import func
+from PIL import Image
 
 # --- CONFIGURAÇÃO INICIAL ---
-st.set_page_config(page_title="Sistema PMP Pro", layout="wide", page_icon="🏭")
+st.set_page_config(page_title="Sistema PMP Fluxo Contínuo", layout="wide", page_icon="🏭")
 
 # --- BANCO DE DADOS ---
 try:
@@ -28,21 +32,16 @@ class Usuario(Base):
     id = Column(Integer, primary_key=True)
     username = Column(String, unique=True)
     senha = Column(String)
-    perfil = Column(String) # ADM, SEPARADOR, CONFERENTE, AMBOS
+    perfil = Column(String)
 
 class Pedido(Base):
     __tablename__ = 'pedidos'
     id = Column(Integer, primary_key=True)
     numero_pedido = Column(String)
     data_pedido = Column(String)
-    status = Column(String) 
-    
+    status = Column(String)
     criado_em = Column(DateTime, default=datetime.now)
-    data_inicio_separacao = Column(DateTime, nullable=True)
-    data_fim_separacao = Column(DateTime, nullable=True) 
-    data_fim_conferencia = Column(DateTime, nullable=True) 
-    data_conclusao = Column(DateTime, nullable=True) 
-    
+    data_conclusao = Column(DateTime, nullable=True)
     itens = relationship("ItemPedido", back_populates="pedido", cascade="all, delete")
     logs = relationship("LogTempo", back_populates="pedido", cascade="all, delete")
 
@@ -54,10 +53,8 @@ class ItemPedido(Base):
     descricao = Column(String)
     unidade = Column(String)
     qtd_solicitada = Column(Float)
-    
     justificativa_divergencia = Column(Text, nullable=True)
     item_adicionado_manualmente = Column(Boolean, default=False)
-    
     pedido = relationship("Pedido", back_populates="itens")
     separacoes = relationship("Separacao", back_populates="item", cascade="all, delete")
 
@@ -67,16 +64,17 @@ class Separacao(Base):
     item_id = Column(Integer, ForeignKey('itens_pedido.id'))
     rastreabilidade = Column(String)
     qtd_separada = Column(Float)
+    
+    # --- NOVO CAMPO: Quantidade contada pelo conferente ---
+    qtd_conferida = Column(Float, nullable=True)
+    
     separador_id = Column(Integer, ForeignKey('usuarios.id'))
     registrado_em = Column(DateTime, default=datetime.now)
-    
-    conferido = Column(Boolean, default=False) 
-    data_conferencia = Column(DateTime, nullable=True)
+    enviado_conferencia = Column(Boolean, default=False)
+    conferido = Column(Boolean, default=False)
     motivo_rejeicao = Column(Text, nullable=True)
-    
-    enviado_sistema = Column(Boolean, default=False) 
+    enviado_sistema = Column(Boolean, default=False)
     data_envio = Column(DateTime, nullable=True)
-    
     item = relationship("ItemPedido", back_populates="separacoes")
 
 class LogTempo(Base):
@@ -84,7 +82,7 @@ class LogTempo(Base):
     id = Column(Integer, primary_key=True)
     pedido_id = Column(Integer, ForeignKey('pedidos.id'))
     usuario_id = Column(Integer, ForeignKey('usuarios.id'))
-    acao = Column(String) # INICIO, PAUSA, FIM
+    acao = Column(String)
     timestamp = Column(DateTime, default=datetime.now)
     pedido = relationship("Pedido", back_populates="logs")
 
@@ -92,7 +90,7 @@ class LogTempo(Base):
 try: Base.metadata.create_all(engine)
 except: pass
 
-# --- FUNÇÕES ---
+# --- FUNÇÕES AUXILIARES ---
 def get_db():
     if 'db' not in st.session_state: st.session_state.db = Session()
     return st.session_state.db
@@ -119,8 +117,8 @@ def encerrar_cronometros_abertos(session, pedido_id):
 
 def calcular_tempos_reais(session, pedido_id):
     logs = session.query(LogTempo).filter_by(pedido_id=pedido_id).order_by(LogTempo.timestamp).all()
-    tempos = {} 
-    status_atual = {} 
+    tempos = {}
+    status_atual = {}
     user_logs = {}
     for log in logs:
         if log.usuario_id not in user_logs: user_logs[log.usuario_id] = []
@@ -181,9 +179,35 @@ def processar_arquivo_robusto(uploaded_file):
                 except: continue
     return itens, num_ped, data_ped
 
+# --- LEITURA PODEROSA COM ZXING ---
+def tentar_ler_codigo_robustamente(uploaded_image):
+    try:
+        file_bytes = np.asarray(bytearray(uploaded_image.read()), dtype=np.uint8)
+        img = cv2.imdecode(file_bytes, 1)
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        
+        results = zxingcpp.read_barcodes(img_rgb)
+        if results: return results[0].text
+
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        enhanced = clahe.apply(gray)
+        
+        results_gray = zxingcpp.read_barcodes(enhanced)
+        if results_gray: return results_gray[0].text
+
+        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        results_bin = zxingcpp.read_barcodes(binary)
+        if results_bin: return results_bin[0].text
+            
+        return None
+    except Exception as e:
+        print(f"Erro ZXing: {e}")
+        return None
+
 # --- TELAS ---
 def login_screen():
-    st.markdown("<h2 style='text-align: center;'>🏭 PMP System Login</h2>", unsafe_allow_html=True)
+    st.markdown("<h2 style='text-align: center;'>🏭 PMP Flow Pro V2</h2>", unsafe_allow_html=True)
     c1, c2, c3 = st.columns([1,2,1])
     with c2:
         with st.form("login"):
@@ -201,9 +225,9 @@ def adm_screen():
     st.title(f"Painel Gerencial (ADM: {st.session_state['user'].username})")
     
     qv = s.query(Pedido).filter(Pedido.status == 'VALIDACAO').count()
-    qa = s.query(Pedido).filter(Pedido.status.notin_(['VALIDACAO', 'PENDENTE'])).count()
+    qa = s.query(Pedido).filter(Pedido.status == 'EM_ANDAMENTO').count()
     
-    t1, t2, t3, t4 = st.tabs(["📥 Importar", f"🛡️ Validação ({qv})", f"🏭 Gestão & Input ({qa})", "👥 Usuários"])
+    t1, t2, t3, t4 = st.tabs(["📥 Importar", f"🛡️ Validação ({qv})", f"🏭 Gestão Contínua ({qa})", "👥 Usuários"])
 
     with t1:
         f = st.file_uploader("Arquivo PMP", type=["xls", "csv"])
@@ -228,7 +252,7 @@ def adm_screen():
             edf = st.data_editor(dval, num_rows="dynamic", column_config={"ID": st.column_config.NumberColumn(disabled=True), "Manter?": st.column_config.CheckboxColumn(default=True)}, hide_index=True, key="ev")
             c1, c2 = st.columns(2)
             if c1.button("🗑️ Excluir"): s.delete(pval); s.commit(); st.rerun()
-            if c2.button("🚀 Liberar p/ Chão de Fábrica"):
+            if c2.button("🚀 Liberar p/ Produção"):
                 itens_banco = {i.id: i for i in pval.itens}; ids_manter = []
                 for index, row in edf.iterrows():
                     if row.get("Manter?", True):
@@ -237,112 +261,119 @@ def adm_screen():
                         else: ids_manter.append(int(rid))
                 for db_id, db_item in itens_banco.items():
                     if db_id not in ids_manter: s.delete(db_item)
-                pval.status = "PENDENTE"; s.commit(); st.success("Liberado!"); time.sleep(1); st.rerun()
+                pval.status = "EM_ANDAMENTO"; s.commit(); st.success("Liberado!"); time.sleep(1); st.rerun()
 
     with t3:
-        peds_ativos = s.query(Pedido).filter(Pedido.status.notin_(['VALIDACAO'])).order_by(Pedido.status, Pedido.id.desc()).all()
-        if not peds_ativos: st.info("Nenhum pedido em andamento.")
-        pid = st.selectbox("Selecione Pedido", [p.id for p in peds_ativos], format_func=lambda x: next((f"{p.numero_pedido} [{p.status}]" for p in peds_ativos if p.id==x), x))
+        peds_ativos = s.query(Pedido).filter(Pedido.status == 'EM_ANDAMENTO').order_by(Pedido.id.desc()).all()
+        peds_concluidos = s.query(Pedido).filter(Pedido.status == 'CONCLUIDO').order_by(Pedido.id.desc()).limit(5).all()
+        lista_peds = peds_ativos + peds_concluidos
+        if not lista_peds: st.info("Nenhum pedido.")
+        pid = st.selectbox("Selecione Pedido", [p.id for p in lista_peds], format_func=lambda x: next((f"{p.numero_pedido} [{p.status}]" for p in lista_peds if p.id==x), x))
         ped = s.query(Pedido).get(pid)
         if ped:
             st.divider()
             c_head, c_btn_reopen = st.columns([4, 1])
             c_head.markdown(f"### 🏭 Pedido: {ped.numero_pedido} | Status: {ped.status}")
             if ped.status == 'CONCLUIDO':
-                if c_btn_reopen.button("🔓 Reabrir Pedido", type="primary"):
-                    ped.status = "AGUARDANDO_INPUT"; ped.data_conclusao = None; s.commit(); st.rerun()
-
+                if c_btn_reopen.button("🔓 Reabrir", type="primary"):
+                    ped.status = "EM_ANDAMENTO"; ped.data_conclusao = None; s.commit(); st.rerun()
+            
             tempos_individuais, status_live = calcular_tempos_reais(s, ped.id)
             tempo_equipe_str = formatar_delta(sum(tempos_individuais.values(), timedelta(0)))
-            tempo_ciclo_total = "00:00:00"
-            if ped.criado_em:
-                fim = ped.data_conclusao if ped.data_conclusao else datetime.now()
-                tempo_ciclo_total = formatar_delta(fim - ped.criado_em)
-            tempo_validacao_str = "00:00:00"
-            if ped.data_fim_separacao and ped.data_conclusao:
-                val = ped.data_conclusao - ped.data_fim_separacao
-                if val.total_seconds() > 0: tempo_validacao_str = formatar_delta(val)
-
-            with st.expander("⏱️ Cronômetros & Performance", expanded=False):
-                k1, k2, k3 = st.columns(3)
-                k1.metric("👷 Tempo Operacional (Equipe)", tempo_equipe_str)
-                k2.metric("🛡️ Lead Time (Total Aberto)", tempo_ciclo_total)
-                k3.metric("📉 Tempo Validação ADM", tempo_validacao_str)
-                st.caption("Detalhe por Operador:")
-                cols = st.columns(len(tempos_individuais)) if len(tempos_individuais) > 0 else [st.container()]; idx = 0
+            with st.expander("⏱️ Tempos da Equipe", expanded=False):
+                st.metric("Total Equipe", tempo_equipe_str)
+                cols = st.columns(4); idx=0
                 for uid, delta in tempos_individuais.items():
-                    with cols[idx % 4] if len(tempos_individuais) > 0 else cols[0]:
-                        unome = s.query(Usuario).get(uid).username; stt = status_live.get(uid, 'PARADO'); icon_stt = "🟢" if stt == 'RODANDO' else "⏸️" if stt == 'PARADO' else "🏁"
-                        st.text(f"{icon_stt} {unome}: {formatar_delta(delta)}")
-                    idx += 1
+                     unome = s.query(Usuario).get(uid).username
+                     cols[idx%4].text(f"{unome}: {formatar_delta(delta)}")
+                     idx+=1
 
             if ped.status != 'CONCLUIDO':
-                with st.expander("➕ Adicionar Produto Extra ao Pedido"):
-                    with st.form("form_add_extra", clear_on_submit=True):
-                        c1, c2, c3, c4 = st.columns([1, 2, 1, 1])
-                        nc = c1.text_input("Código"); nd = c2.text_input("Descrição"); nq = c3.number_input("Qtd Meta", min_value=0.1, value=1.0)
-                        if c4.form_submit_button("Adicionar"):
-                            if nc and nd: s.add(ItemPedido(pedido_id=ped.id, codigo=nc, descricao=nd, unidade="UN", qtd_solicitada=nq, item_adicionado_manualmente=True)); s.commit(); st.rerun()
+                 with st.expander("➕ Adicionar Extra"):
+                    with st.form("add_extra"):
+                         c1, c2, c3, c4 = st.columns([1, 2, 1, 1])
+                         nc = c1.text_input("Cód"); nd = c2.text_input("Desc"); nq = c3.number_input("Qtd", min_value=0.1)
+                         if c4.form_submit_button("Add") and nc:
+                             s.add(ItemPedido(pedido_id=ped.id, codigo=nc, descricao=nd, unidade="UN", qtd_solicitada=nq, item_adicionado_manualmente=True)); s.commit(); st.rerun()
 
-            pendencias_input = 0
+            pendencias_lancamento = 0
+            pendencias_separacao = 0
+            
             for it in ped.itens:
-                tot = round(sum([sep.qtd_separada for sep in it.separacoes]), 2)
-                meta = round(it.qtd_solicitada, 2)
-                divergente = (tot != meta) or it.item_adicionado_manualmente
+                tot_sep = sum([sep.qtd_separada for sep in it.separacoes])
+                meta = it.qtd_solicitada
                 
-                # --- CORREÇÃO DA LÓGICA DE CORES ---
-                if tot > meta: color, icon = "orange", "⚠️" # EXCEDE
-                elif tot == meta: color, icon = "green", "✅" # OK
-                else: color, icon = "red", "⬜" # FALTA
+                if tot_sep == 0: style, icon = f"{it.codigo} {it.descricao}", "⬜"
+                elif tot_sep < meta: style, icon = f":orange[{it.codigo} {it.descricao}]", "⏳"
+                elif tot_sep == meta: style, icon = f":green[{it.codigo} {it.descricao}]", "✅"
+                else: style, icon = f":red[{it.codigo} {it.descricao}]", "🚫"
 
-                with st.expander(f"{icon} :{color}[{it.codigo} {it.descricao}] ({tot}/{meta})"):
-                    if divergente and ped.status != 'CONCLUIDO':
-                        st.markdown("**📝 Justificativa de Divergência/Inclusão:**")
-                        just = st.text_input("Motivo (Obrigatório)", value=it.justificativa_divergencia if it.justificativa_divergencia else "", key=f"just_{it.id}")
-                        if just != it.justificativa_divergencia: it.justificativa_divergencia = just; s.commit()
-                    elif it.justificativa_divergencia: st.info(f"Justificativa: {it.justificativa_divergencia}")
+                with st.expander(f"{icon} {style} ({tot_sep}/{meta})"):
+                     if (tot_sep != meta) and ped.status != 'CONCLUIDO':
+                         j = st.text_input("Justificativa", value=it.justificativa_divergencia or "", key=f"j_{it.id}")
+                         if j != it.justificativa_divergencia: it.justificativa_divergencia = j; s.commit()
+                     
+                     if not it.separacoes: st.caption("Nada separado.")
+                     
+                     # --- CABEÇALHO DA TABELA ADM ---
+                     cols_h = st.columns([3, 1, 1, 2, 2, 1])
+                     cols_h[0].markdown("**Rastreabilidade**")
+                     cols_h[1].markdown("**Sep.**")
+                     cols_h[2].markdown("**Conf.**") # Nova coluna para ADM ver
+                     cols_h[3].markdown("**Status Conf.**")
+                     cols_h[4].markdown("**ERP**")
 
-                    cols = st.columns([3, 1, 2, 2, 1])
-                    cols[0].markdown("**Rastreabilidade**"); cols[1].markdown("**Qtd**"); cols[2].markdown("**Status Conf.**"); cols[3].markdown("**Input ERP**")
-                    if not it.separacoes: st.caption("Aguardando separação...")
-                    for sep in it.separacoes:
-                        c1, c2, c3, c4, c5 = st.columns([3, 1, 2, 2, 1])
-                        c1.text(sep.rastreabilidade); c2.text(sep.qtd_separada)
-                        if sep.motivo_rejeicao: c3.error(f"RECUSADO: {sep.motivo_rejeicao}")
-                        elif sep.conferido: c3.success("OK")
-                        else: c3.warning("Pend.")
-                        disabled_chk = (ped.status == 'CONCLUIDO')
-                        is_checked = c4.checkbox("Lançado", value=sep.enviado_sistema, key=f"chk_adm_{sep.id}", disabled=disabled_chk)
-                        if is_checked != sep.enviado_sistema: sep.enviado_sistema = is_checked; sep.data_envio = datetime.now() if is_checked else None; s.commit(); st.rerun()
-                        if not sep.enviado_sistema: pendencias_input += 1
+                     for sep in it.separacoes:
+                         c1, c2, c3, c4, c5, c6 = st.columns([3, 1, 1, 2, 2, 1])
+                         c1.text(sep.rastreabilidade)
+                         c2.text(sep.qtd_separada)
+                         
+                         # --- COLUNA NOVA: MOSTRAR CONFERIDO ---
+                         # Se houver divergencia, pinta de vermelho
+                         val_conf = sep.qtd_conferida if sep.qtd_conferida is not None else 0.0
+                         if sep.conferido and (val_conf != sep.qtd_separada):
+                             c3.markdown(f":red[**{val_conf}**]") # Alerta visual
+                         else:
+                             c3.text(val_conf if sep.conferido else "-")
+                         
+                         if sep.motivo_rejeicao: c4.error("RECUSADO")
+                         elif sep.conferido: c4.success("CONFERIDO")
+                         elif sep.enviado_conferencia: c4.warning("NA CONFERÊNCIA")
+                         else: c4.caption("NA SEPARAÇÃO")
+                         
+                         disable_erp = (ped.status == 'CONCLUIDO')
+                         is_chk = c5.checkbox("Lançado", value=sep.enviado_sistema, key=f"erp_{sep.id}", disabled=disable_erp)
+                         if is_chk != sep.enviado_sistema:
+                             sep.enviado_sistema = is_chk; sep.data_envio = datetime.now() if is_chk else None; s.commit(); st.rerun()
+                         
+                         if not sep.motivo_rejeicao and not sep.enviado_sistema: 
+                             pendencias_lancamento += 1
 
+                if tot_sep < meta: pendencias_separacao += 1
+            
             st.divider()
+            
             if ped.status == 'CONCLUIDO':
-                 st.success(f"Pedido Concluído em {ped.data_conclusao}")
-                 data = []
-                 for i in ped.itens:
-                     base = {"Cod": i.codigo, "Desc": i.descricao, "Meta": i.qtd_solicitada, "Justificativa": i.justificativa_divergencia}
-                     if not i.separacoes:
-                         base.update({"Qtd": 0, "Status": "Não Separado"}); data.append(base)
-                     else:
-                         for sep in i.separacoes:
-                             row = base.copy(); row.update({"Qtd": sep.qtd_separada, "Rastreabilidade": sep.rastreabilidade, "Lançado ERP": "SIM" if sep.enviado_sistema else "NÃO"}); data.append(row)
-                 out = io.BytesIO()
-                 with pd.ExcelWriter(out, engine='xlsxwriter') as w: pd.DataFrame(data).to_excel(w, index=False)
-                 st.download_button("⬇️ Baixar Excel Final", out, f"FINAL_{ped.numero_pedido}.xlsx")
+                st.success(f"Encerrado em {ped.data_conclusao}")
+                data_xls = []
+                for i in ped.itens:
+                    base = {"Cod": i.codigo, "Desc": i.descricao, "Meta": i.qtd_solicitada, "Justificativa": i.justificativa_divergencia}
+                    if not i.separacoes:
+                        base.update({"Qtd": 0, "Rastreabilidade": "-", "Conferido": "NAO"}); data_xls.append(base)
+                    for sp in i.separacoes:
+                        ln = base.copy(); ln.update({"Qtd": sp.qtd_separada, "Qtd Conferida": sp.qtd_conferida, "Rastreabilidade": sp.rastreabilidade, "Conferido": "SIM" if sp.conferido else "NAO", "ERP": "SIM" if sp.enviado_sistema else "NAO"}); data_xls.append(ln)
+                out = io.BytesIO()
+                with pd.ExcelWriter(out, engine='xlsxwriter') as w: pd.DataFrame(data_xls).to_excel(w, index=False)
+                st.download_button("⬇️ Excel Final", out, f"F_{ped.numero_pedido}.xlsx")
             else:
-                pendencias_justificativa = 0
-                for it in ped.itens:
-                    tot = round(sum([sep.qtd_separada for sep in it.separacoes]), 2)
-                    meta = round(it.qtd_solicitada, 2)
-                    is_div = (tot != meta) or it.item_adicionado_manualmente
-                    if is_div and (not it.justificativa_divergencia or len(it.justificativa_divergencia.strip()) < 3): pendencias_justificativa += 1
-                if pendencias_input == 0:
-                    if pendencias_justificativa == 0:
-                        if st.button("✅ CONCLUIR PEDIDO", type="primary"):
-                            encerrar_cronometros_abertos(s, ped.id); ped.status = "CONCLUIDO"; ped.data_conclusao = datetime.now(); s.commit(); st.balloons(); time.sleep(1); st.rerun()
-                    else: st.error(f"🚫 Existem {pendencias_justificativa} itens divergentes SEM JUSTIFICATIVA.")
-                else: st.warning(f"⚠️ Faltam lançar {pendencias_input} itens no ERP.")
+                st.markdown(f"**Status Atual:** {pendencias_lancamento} itens pendentes de lançamento no ERP. {pendencias_separacao} itens com saldo de separação.")
+                
+                if pendencias_lancamento > 0:
+                     st.error(f"🚫 Impossível arquivar: Existem {pendencias_lancamento} itens que ainda não foram lançados no sistema.")
+                else:
+                    if st.button("✅ CONCLUIR PEDIDO (ARQUIVAR)", type="primary"):
+                        encerrar_cronometros_abertos(s, ped.id)
+                        ped.status = 'CONCLUIDO'; ped.data_conclusao = datetime.now(); s.commit(); st.balloons(); time.sleep(1); st.rerun()
 
     with t4:
         with st.form("nu"):
@@ -357,117 +388,204 @@ def adm_screen():
 def op_screen():
     s = get_db()
     u = st.session_state['user']
-    st.subheader(f"Área Operacional: {u.username} ({u.perfil})")
-    tabs_to_show = []
-    if u.perfil in ['SEPARADOR', 'AMBOS']: tabs_to_show.append("📦 Separação")
-    if u.perfil in ['CONFERENTE', 'AMBOS']: tabs_to_show.append("📋 Conferência")
-    if not tabs_to_show: st.error("Perfil sem acesso."); return
-    tabs = st.tabs(tabs_to_show)
+    st.subheader(f"Operação: {u.username} ({u.perfil})")
     
-    # --- SEPARAÇÃO ---
-    if "📦 Separação" in tabs_to_show:
-        with tabs[tabs_to_show.index("📦 Separação")]:
-            peds_sep = s.query(Pedido).filter(Pedido.status.in_(['PENDENTE', 'EM_SEPARACAO', 'CORRECAO'])).all()
-            if not peds_sep: st.info("Sem pedidos pendentes.")
+    tabs = []
+    if u.perfil in ['SEPARADOR', 'AMBOS']: tabs.append("📦 Separação")
+    if u.perfil in ['CONFERENTE', 'AMBOS']: tabs.append("📋 Conferência")
+    
+    if not tabs: st.error("Sem acesso."); return
+    ts = st.tabs(tabs)
+    
+    # --- ABA SEPARAÇÃO ---
+    if "📦 Separação" in tabs:
+        with ts[tabs.index("📦 Separação")]:
+            peds_all = s.query(Pedido).filter(Pedido.status == 'EM_ANDAMENTO').all()
+            peds_visiveis = []
+            for p in peds_all:
+                mostrar = False
+                for it in p.itens:
+                    tot = sum([x.qtd_separada for x in it.separacoes])
+                    if tot < it.qtd_solicitada: mostrar = True
+                    rascunhos = [x for x in it.separacoes if (not x.enviado_conferencia) or (x.motivo_rejeicao)]
+                    if rascunhos: mostrar = True
+                if mostrar: peds_visiveis.append(p)
+
+            if not peds_visiveis: st.info("Tudo em dia! Aguardando novos pedidos do ADM.")
             else:
-                pid = st.selectbox("Pedido (Separação)", [p.id for p in peds_sep], format_func=lambda x: next((f"{p.numero_pedido} [{p.status}]" for p in peds_sep if p.id==x), x))
+                pid = st.selectbox("Selecione Pedido", [p.id for p in peds_visiveis], format_func=lambda x: next((f"{p.numero_pedido}" for p in peds_visiveis if p.id==x), x), key="sel_ped_sep")
                 ped = s.query(Pedido).get(pid)
                 
                 tempos, _ = calcular_tempos_reais(s, ped.id)
                 meu_tempo = tempos.get(u.id, timedelta(0))
-                st.caption(f"⏱️ Seu tempo neste pedido: **{formatar_delta(meu_tempo)}**")
+                st.caption(f"Tempo acumulado: {formatar_delta(meu_tempo)}")
                 
-                meu_log = s.query(LogTempo).filter_by(pedido_id=ped.id, usuario_id=u.id).order_by(LogTempo.timestamp.desc()).first()
-                estado = "PARADO"
-                if meu_log and meu_log.acao == "INICIO": estado = "RODANDO"
-
-                c_btn, _ = st.columns([1, 4])
-                if estado == "PARADO":
-                    if c_btn.button("▶️ TRABALHAR", type="primary"):
-                        if ped.status == 'PENDENTE': ped.status = 'EM_SEPARACAO'; ped.data_inicio_separacao = datetime.now()
+                log = s.query(LogTempo).filter_by(pedido_id=ped.id, usuario_id=u.id).order_by(LogTempo.timestamp.desc()).first()
+                working = (log and log.acao == "INICIO")
+                
+                c_btn, c_mode, _ = st.columns([1, 2, 2])
+                if not working:
+                    if c_btn.button("▶️ INICIAR TRABALHO", type="primary"):
                         s.add(LogTempo(pedido_id=ped.id, usuario_id=u.id, acao="INICIO")); s.commit(); st.rerun()
                 else:
                     if c_btn.button("⏸️ PAUSAR"):
                         s.add(LogTempo(pedido_id=ped.id, usuario_id=u.id, acao="PAUSA")); s.commit(); st.rerun()
+                
+                use_camera = c_mode.toggle("📸 Câmera (Melhorado)")
 
                 st.divider()
-                st.info(f"Pedido: {ped.numero_pedido}")
-                if ped.status == 'CORRECAO': st.error("⚠️ ESTE PEDIDO RETORNOU DA CONFERÊNCIA! Corrija os itens em vermelho.")
-
+                pendencias_envio = 0
+                
                 for it in ped.itens:
                     done = round(sum([sep.qtd_separada for sep in it.separacoes]), 2)
                     meta = round(it.qtd_solicitada, 2)
+                    meus_rascunhos = [x for x in it.separacoes if not x.enviado_conferencia]
                     
-                    # --- CORREÇÃO DA LÓGICA DE CORES (SEPARADOR) ---
-                    if done > meta: color, icon = "orange", "⚠️"
-                    elif done == meta: color, icon = "green", "✅"
-                    else: color, icon = "red", "⬜"
+                    if done == 0: style, icon = f"{it.codigo} {it.descricao}", "⬜"
+                    elif done < meta: style, icon = f":orange[{it.codigo} {it.descricao}]", "⏳"
+                    elif done == meta: style, icon = f":green[{it.codigo} {it.descricao}]", "✅"
+                    else: style, icon = f":red[{it.codigo} {it.descricao}]", "🚫"
                     
-                    with st.expander(f":{color}[{icon} {it.codigo} {it.descricao}] ({done}/{meta})"):
+                    open_exp = (done < meta) or (len(meus_rascunhos) > 0)
+                    
+                    with st.expander(f"{icon} {style} ({done}/{meta})", expanded=open_exp):
                         for sep in it.separacoes:
                             c1, c2, c3 = st.columns([4, 2, 1])
-                            if sep.motivo_rejeicao: c1.error(f"{sep.rastreabilidade} (Recusado: {sep.motivo_rejeicao})")
-                            else: c1.text(sep.rastreabilidade)
-                            c2.text(sep.qtd_separada)
-                            if c3.button("🗑️", key=f"d{sep.id}"): s.delete(sep); s.commit(); st.rerun()
-                        
-                        if estado == "RODANDO":
-                            with st.form(key=f"form_sep_{it.id}", clear_on_submit=True):
-                                c1, c2, c3 = st.columns([3, 2, 1])
-                                nl = c1.text_input("Lote"); nq = c2.number_input("Qtd", step=0.1, min_value=0.0)
-                                if c3.form_submit_button("Add"):
-                                    if nl and nq > 0: s.add(Separacao(item_id=it.id, rastreabilidade=nl, qtd_separada=nq, separador_id=u.id)); s.commit(); st.rerun()
-                        else: st.warning("▶️ Inicie o trabalho para editar.")
-                
-                st.divider()
-                if ped.status in ['EM_SEPARACAO', 'CORRECAO']:
-                    if st.button("🏁 ENVIAR PARA CONFERÊNCIA"):
-                        ped.status = "EM_CONFERENCIA"; ped.data_fim_separacao = datetime.now(); s.commit(); st.success("Enviado!"); time.sleep(1); st.rerun()
-
-    # --- CONFERÊNCIA ---
-    if "📋 Conferência" in tabs_to_show:
-        with tabs[tabs_to_show.index("📋 Conferência")]:
-            peds_conf = s.query(Pedido).filter(Pedido.status.in_(['EM_CONFERENCIA', 'AGUARDANDO_INPUT'])).all()
-            if not peds_conf: st.info("Sem pedidos para conferência.")
-            else:
-                pid = st.selectbox("Pedido (Conferência)", [p.id for p in peds_conf], format_func=lambda x: next((f"{p.numero_pedido} [{p.status}]" for p in peds_conf if p.id==x), x))
-                ped = s.query(Pedido).get(pid)
-                
-                pendencias_conf = 0
-                itens_recusados = False
-                for it in ped.itens:
-                    with st.expander(f"{it.codigo} {it.descricao}"):
-                        cols = st.columns([3, 1, 1, 3])
-                        cols[0].write("**Rastro**"); cols[1].write("**Qtd**"); cols[2].write("**OK?**"); cols[3].write("**Recusar**")
-                        for sep in it.separacoes:
-                            c1, c2, c3, c4 = st.columns([3, 1, 1, 3])
-                            if sep.motivo_rejeicao:
-                                c1.markdown(f"~~{sep.rastreabilidade}~~"); c4.error(f"{sep.motivo_rejeicao}"); itens_recusados = True
+                            lbl = sep.rastreabilidade
+                            if sep.motivo_rejeicao: 
+                                lbl += f" ❌ RECUSADO: {sep.motivo_rejeicao}"
+                                c1.error(lbl)
+                            elif sep.enviado_conferencia:
+                                lbl += " (Enviado)"
+                                c1.text(lbl)
                             else:
-                                c1.text(sep.rastreabilidade); c2.text(sep.qtd_separada)
-                                if not sep.conferido:
-                                    with c4.popover("❌ Recusar"):
-                                        reason = st.text_input("Motivo", key=f"reason_{sep.id}")
-                                        if st.button("Confirmar", key=f"btn_r_{sep.id}"):
-                                            if reason: sep.motivo_rejeicao = reason; sep.conferido = False; s.commit(); st.rerun()
+                                lbl += " (Rascunho)"
+                                c1.markdown(f"**{lbl}**")
+                            c2.text(sep.qtd_separada)
+                            pode_apagar = (not sep.enviado_conferencia) or (sep.motivo_rejeicao is not None)
+                            if pode_apagar:
+                                if c3.button("🗑️", key=f"del_{sep.id}"):
+                                    s.delete(sep); s.commit(); st.rerun()
+                            if not sep.enviado_conferencia and not sep.motivo_rejeicao:
+                                pendencias_envio += 1
 
-                            ic = c3.checkbox("OK", value=sep.conferido, key=f"c_{sep.id}")
-                            if ic != sep.conferido: 
-                                sep.conferido = ic
-                                if ic: sep.motivo_rejeicao = None
-                                s.commit(); st.rerun()
-                            if not sep.conferido and not sep.motivo_rejeicao: pendencias_conf += 1
-                
+                        if working:
+                            if done < meta or meta == 0:
+                                st.markdown("---")
+                                with st.form(key=f"add_sep_{it.id}", clear_on_submit=True):
+                                    if use_camera:
+                                        img = st.camera_input("Foto do Código", key=f"cam_{it.id}")
+                                        decoded_text = ""
+                                        if img:
+                                            decoded_text = tentar_ler_codigo_robustamente(img)
+                                            if decoded_text:
+                                                st.success(f"Lido: {decoded_text}")
+                                            else:
+                                                st.error("⚠️ Falha na leitura.")
+                                        
+                                        val_inicial = decoded_text if decoded_text else ""
+                                        nr = st.text_input("Rastreabilidade", value=val_inicial)
+                                    else:
+                                        nr = st.text_input("Rastreabilidade", placeholder="Bipe aqui...")
+
+                                    nq = st.number_input("Qtd", min_value=0.01, step=0.1)
+                                    
+                                    if st.form_submit_button("Salvar"):
+                                        if nr and nq:
+                                            s.add(Separacao(item_id=it.id, rastreabilidade=nr, qtd_separada=nq, separador_id=u.id, enviado_conferencia=False))
+                                            s.commit(); st.rerun()
+                                        else:
+                                            st.warning("Preencha os dados.")
+                        else:
+                            st.caption("Inicie o trabalho para adicionar.")
+
                 st.divider()
-                if itens_recusados:
-                    st.error("⚠️ Existem itens rejeitados/recusados.")
-                    if st.button("↩️ DEVOLVER PARA SEPARAÇÃO (CORREÇÃO)", type="primary"):
-                        ped.status = "CORRECAO"; s.commit(); st.success("Devolvido!"); time.sleep(1); st.rerun()
-                elif pendencias_conf == 0:
-                    if ped.status == 'EM_CONFERENCIA':
-                        if st.button("✅ APROVAR TUDO"):
-                            ped.status = "AGUARDANDO_INPUT"; ped.data_fim_conferencia = datetime.now(); s.commit(); st.success("Aprovado!"); time.sleep(1); st.rerun()
-                else: st.warning(f"Faltam {pendencias_conf} itens.")
+                if pendencias_envio > 0:
+                    st.warning(f"Você tem {pendencias_envio} rastreabilidades prontas.")
+                    if st.button("🚀 ENVIAR TUDO PARA CONFERÊNCIA", type="primary"):
+                        rascunhos = s.query(Separacao).join(ItemPedido).filter(ItemPedido.pedido_id == ped.id, Separacao.enviado_conferencia == False).all()
+                        for r in rascunhos: r.enviado_conferencia = True
+                        s.commit(); st.success("Enviado!"); time.sleep(1); st.rerun()
+                else:
+                    if working: st.info("Adicione itens para enviar.")
+
+    # --- ABA CONFERÊNCIA (LÓGICA NOVA DE CONTAGEM) ---
+    if "📋 Conferência" in tabs:
+        with ts[tabs.index("📋 Conferência")]:
+            peds_conf = []
+            raw_peds = s.query(Pedido).filter(Pedido.status == 'EM_ANDAMENTO').all()
+            for p in raw_peds:
+                tem = False
+                for it in p.itens:
+                    # Pendente se: enviado pra conf E não conferido E não rejeitado
+                    pendentes = [x for x in it.separacoes if x.enviado_conferencia and not x.conferido and not x.motivo_rejeicao]
+                    if pendentes: tem = True; break
+                if tem: peds_conf.append(p)
+            
+            if not peds_conf: st.info("Nada para conferir.")
+            else:
+                pid = st.selectbox("Selecione Pedido", [p.id for p in peds_conf], format_func=lambda x: next((f"{p.numero_pedido}" for p in peds_conf if p.id==x), x), key="sel_ped_conf")
+                ped = s.query(Pedido).get(pid)
+                st.divider()
+                st.markdown("### Itens aguardando sua contagem")
+                count_pend = 0
+                for it in ped.itens:
+                    to_check = [x for x in it.separacoes if x.enviado_conferencia and not x.conferido and not x.motivo_rejeicao]
+                    if to_check:
+                        with st.expander(f"{it.codigo} {it.descricao} ({len(to_check)} lotes)", expanded=True):
+                            # Cabeçalho da tabela de conferência
+                            c_h1, c_h2, c_h3, c_h4 = st.columns([3, 1, 2, 2])
+                            c_h1.markdown("**Rastreabilidade**")
+                            c_h2.markdown("**Qtd (Sep)**")
+                            c_h3.markdown("**Sua Contagem**")
+                            c_h4.markdown("**Ação**")
+                            
+                            for sep in to_check:
+                                c1, c2, c3, c4 = st.columns([3, 1, 2, 2])
+                                c1.text(sep.rastreabilidade)
+                                c2.text(sep.qtd_separada)
+                                
+                                # Input de Contagem
+                                key_in = f"in_conf_{sep.id}"
+                                val_contada = c3.number_input("Qtd", key=key_in, step=0.1, label_visibility="collapsed")
+                                
+                                # Botão de Ação
+                                if c4.button("Conferir", key=f"btn_check_{sep.id}"):
+                                    if val_contada == sep.qtd_separada:
+                                        # Caso ideal: Bateu!
+                                        sep.qtd_conferida = val_contada
+                                        sep.conferido = True
+                                        sep.data_conferencia = datetime.now()
+                                        s.commit()
+                                        st.toast("✅ Contagem Correta! Aprovado.")
+                                        time.sleep(0.5)
+                                        st.rerun()
+                                    else:
+                                        # Divergência: Salva no estado para mostrar alerta
+                                        st.session_state[f"alert_div_{sep.id}"] = True
+                                
+                                # Se houver alerta de divergência no estado
+                                if st.session_state.get(f"alert_div_{sep.id}"):
+                                    st.warning(f"⚠️ DIVERGÊNCIA! Separado: {sep.qtd_separada} | Contado: {val_contada}")
+                                    cola, colb = st.columns(2)
+                                    if cola.button("Aceitar Divergência", key=f"accept_{sep.id}"):
+                                        sep.qtd_conferida = val_contada
+                                        sep.conferido = True
+                                        sep.data_conferencia = datetime.now()
+                                        del st.session_state[f"alert_div_{sep.id}"] # Limpa alerta
+                                        s.commit()
+                                        st.rerun()
+                                    
+                                    if colb.button("Recusar/Devolver", key=f"reject_{sep.id}"):
+                                        sep.motivo_rejeicao = f"Divergência de Qtd (Sep: {sep.qtd_separada} vs Conf: {val_contada})"
+                                        sep.enviado_conferencia = False
+                                        sep.conferido = False
+                                        del st.session_state[f"alert_div_{sep.id}"] # Limpa alerta
+                                        s.commit()
+                                        st.rerun()
+
+                                count_pend += 1
+                if count_pend == 0: st.success("Tudo conferido!")
 
 # --- MAIN ---
 init_users()

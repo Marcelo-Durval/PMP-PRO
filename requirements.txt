@@ -5,3 +5,7 @@ openpyxl==3.1.2
 xlrd==2.0.1
 sqlalchemy==2.0.28
 psycopg2-binary==2.9.9
+Pillow==10.2.0
+opencv-python-headless==4.9.0.80
+numpy==1.26.4
+zxing-cpp==2.2.0
