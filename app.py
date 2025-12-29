@@ -1,6 +1,5 @@
 import streamlit as st
 import pandas as pd
-import re
 import io
 import time
 import os
@@ -14,7 +13,7 @@ from sqlalchemy.sql import func
 from PIL import Image
 
 # --- CONFIGURAÇÃO INICIAL ---
-st.set_page_config(page_title="Sistema PMP Fluxo Contínuo", layout="wide", page_icon="🏭")
+st.set_page_config(page_title="Sistema PMP Pro - ID Dinâmico", layout="wide", page_icon="🏭")
 
 # --- BANCO DE DADOS ---
 try:
@@ -49,6 +48,11 @@ class ItemPedido(Base):
     __tablename__ = 'itens_pedido'
     id = Column(Integer, primary_key=True)
     pedido_id = Column(Integer, ForeignKey('pedidos.id'))
+    
+    # --- NOVO CAMPO: ID DE IMPORTAÇÃO ---
+    # Armazena o ID do lote ou "LINHA_X" para rastrear atualizações
+    id_importacao = Column(String, nullable=True) 
+    
     codigo = Column(String)
     descricao = Column(String)
     unidade = Column(String)
@@ -64,10 +68,7 @@ class Separacao(Base):
     item_id = Column(Integer, ForeignKey('itens_pedido.id'))
     rastreabilidade = Column(String)
     qtd_separada = Column(Float)
-    
-    # --- NOVO CAMPO: Quantidade contada pelo conferente ---
     qtd_conferida = Column(Float, nullable=True)
-    
     separador_id = Column(Integer, ForeignKey('usuarios.id'))
     registrado_em = Column(DateTime, default=datetime.now)
     enviado_conferencia = Column(Boolean, default=False)
@@ -147,59 +148,32 @@ def formatar_delta(delta):
     minutes, seconds = divmod(remainder, 60)
     return f"{hours:02}:{minutes:02}:{seconds:02}"
 
-def processar_arquivo_robusto(uploaded_file):
-    df_raw = None
-    try: df_raw = pd.read_excel(uploaded_file, header=None, dtype=str)
-    except:
-        try: uploaded_file.seek(0); content = uploaded_file.getvalue().decode('latin-1')
-        except: content = uploaded_file.getvalue().decode('utf-8')
-        df_raw = pd.DataFrame([line.split(',') for line in content.split('\n')])
+def ler_planilha_simples(uploaded_file):
+    try:
+        if uploaded_file.name.endswith('.csv'):
+            try: return pd.read_csv(uploaded_file, sep=';', dtype=str)
+            except: return pd.read_csv(uploaded_file, sep=',', dtype=str)
+        else:
+            return pd.read_excel(uploaded_file, dtype=str)
+    except Exception as e:
+        st.error(f"Erro ao ler arquivo: {e}")
+        return None
 
-    data_ped, num_ped = "", "SEM_NUMERO"
-    itens = []
-    reading = False
-    reg_data = re.compile(r'(\d{2}/\d{2}/\d{4})')
-    reg_ped = re.compile(r'(?<!\d)(\d{5,6})(?!\d)')
-
-    for row in df_raw.itertuples(index=False):
-        row_clean = [str(x).strip() for x in row if str(x).lower() not in ['nan', 'none', '', 'nat']]
-        line_str = " ".join(row_clean)
-        if "Data" in line_str and not data_ped:
-            m = reg_data.search(line_str)
-            if m: data_ped = m.group(1)
-        if "Pedido" in line_str and "SEM_NUMERO" in num_ped:
-            m = reg_ped.search(line_str)
-            if m: num_ped = m.group(1)
-        if "TOTAIS" in line_str.replace(" ", "").upper(): reading = True; continue
-        if reading and len(row_clean) >= 3:
-            first = row_clean[0].replace('"', '')
-            last = row_clean[-1].replace('"', '').replace(',', '.')
-            if first.isdigit():
-                try: itens.append({"cod": first, "desc": " ".join(row_clean[1:-1]), "und": row_clean[-2] if len(row_clean)>=4 else "UN", "qtd": float(last)})
-                except: continue
-    return itens, num_ped, data_ped
-
-# --- LEITURA PODEROSA COM ZXING ---
 def tentar_ler_codigo_robustamente(uploaded_image):
     try:
         file_bytes = np.asarray(bytearray(uploaded_image.read()), dtype=np.uint8)
         img = cv2.imdecode(file_bytes, 1)
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        
         results = zxingcpp.read_barcodes(img_rgb)
         if results: return results[0].text
-
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
         enhanced = clahe.apply(gray)
-        
         results_gray = zxingcpp.read_barcodes(enhanced)
         if results_gray: return results_gray[0].text
-
         _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         results_bin = zxingcpp.read_barcodes(binary)
         if results_bin: return results_bin[0].text
-            
         return None
     except Exception as e:
         print(f"Erro ZXing: {e}")
@@ -207,7 +181,7 @@ def tentar_ler_codigo_robustamente(uploaded_image):
 
 # --- TELAS ---
 def login_screen():
-    st.markdown("<h2 style='text-align: center;'>🏭 PMP Flow Pro V2</h2>", unsafe_allow_html=True)
+    st.markdown("<h2 style='text-align: center;'>🏭 PMP Flow Pro</h2>", unsafe_allow_html=True)
     c1, c2, c3 = st.columns([1,2,1])
     with c2:
         with st.form("login"):
@@ -227,29 +201,220 @@ def adm_screen():
     qv = s.query(Pedido).filter(Pedido.status == 'VALIDACAO').count()
     qa = s.query(Pedido).filter(Pedido.status == 'EM_ANDAMENTO').count()
     
-    t1, t2, t3, t4 = st.tabs(["📥 Importar", f"🛡️ Validação ({qv})", f"🏭 Gestão Contínua ({qa})", "👥 Usuários"])
+    t1, t2, t3, t4 = st.tabs(["📥 Importar", f"🛡️ Validação ({qv})", f"🏭 Gestão ({qa})", "👥 Usuários"])
 
+    # --- ABA IMPORTAÇÃO FLEXÍVEL COM ID PERSONALIZADO ---
     with t1:
-        f = st.file_uploader("Arquivo PMP", type=["xls", "csv"])
-        if f and st.button("Processar"):
-            itens, num, dat = processar_arquivo_robusto(f)
-            if itens:
-                if s.query(Pedido).filter_by(numero_pedido=num).first(): st.error("Existe!")
+        # Verifica se estamos no modo de "Mesclagem" (Merge)
+        if 'merge_data' in st.session_state:
+            st.warning(f"⚠️ O Pedido **{st.session_state['merge_ped_num']}** já existe!")
+            st.markdown("### 🔍 Análise de Divergências (Baseado no ID Único)")
+            
+            novos_itens = st.session_state['merge_data']['novos']
+            atualizados = st.session_state['merge_data']['atualizados']
+            
+            c_diff1, c_diff2 = st.columns(2)
+            
+            with c_diff1:
+                st.markdown(f"**🆕 Itens Novos ({len(novos_itens)})**")
+                if novos_itens:
+                    df_novos = pd.DataFrame(novos_itens)
+                    # Mostra coluna de ID se disponível
+                    cols_show = ['id_importacao', 'codigo', 'descricao', 'qtd_solicitada']
+                    st.dataframe(df_novos[cols_show], use_container_width=True, hide_index=True)
                 else:
-                    ped = Pedido(numero_pedido=num, data_pedido=dat, status="VALIDACAO")
-                    s.add(ped); s.flush()
-                    for i in itens: s.add(ItemPedido(pedido_id=ped.id, codigo=i['cod'], descricao=i['desc'], unidade=i['und'], qtd_solicitada=i['qtd']))
-                    s.commit(); st.success(f"Pedido {num} na Validação!")
-            else: st.error("Erro leitura")
+                    st.info("Nenhum item novo.")
 
+            with c_diff2:
+                st.markdown(f"**🔄 Alterações de Qtd ({len(atualizados)})**")
+                if atualizados:
+                    # Mostra a mudança
+                    st.dataframe(pd.DataFrame(atualizados)[['id_importacao', 'codigo', 'qtd_antiga', 'qtd_nova']], use_container_width=True, hide_index=True)
+                else:
+                    st.info("Nenhuma alteração em itens existentes.")
+
+            st.divider()
+            c_act1, c_act2 = st.columns(2)
+            
+            if c_act1.button("❌ Cancelar", type="secondary"):
+                del st.session_state['merge_data']
+                del st.session_state['merge_ped_num']
+                if 'sugestao_nome_pedido' in st.session_state: del st.session_state['sugestao_nome_pedido']
+                st.rerun()
+                
+            if c_act2.button("✅ CONFIRMAR ATUALIZAÇÃO", type="primary"):
+                try:
+                    ped_existente = s.query(Pedido).filter_by(numero_pedido=st.session_state['merge_ped_num']).first()
+                    
+                    # 1. Adicionar Novos
+                    for n in novos_itens:
+                        s.add(ItemPedido(
+                            pedido_id=ped_existente.id, 
+                            id_importacao=n['id_importacao'], # Chave Mágica
+                            codigo=n['codigo'], 
+                            descricao=n['descricao'], 
+                            unidade=n['unidade'], 
+                            qtd_solicitada=n['qtd_solicitada']
+                        ))
+                    
+                    # 2. Atualizar Existentes (pelo ID de importação)
+                    for upd in atualizados:
+                        item_db = s.query(ItemPedido).filter_by(pedido_id=ped_existente.id, id_importacao=upd['id_importacao']).first()
+                        if item_db:
+                            item_db.qtd_solicitada = upd['qtd_nova']
+                            # Se quiser atualizar descrição também: item_db.descricao = upd['descricao']
+                    
+                    s.commit()
+                    st.success("Pedido atualizado com sucesso!")
+                    del st.session_state['merge_data']
+                    del st.session_state['merge_ped_num']
+                    if 'sugestao_nome_pedido' in st.session_state: del st.session_state['sugestao_nome_pedido']
+                    time.sleep(1.5); st.rerun()
+                except Exception as e:
+                    st.error(f"Erro: {e}")
+
+        else:
+            # --- TELA DE UPLOAD PADRÃO ---
+            st.markdown("### 1. Carregue a Planilha")
+            f = st.file_uploader("Arquivo", type=["xlsx", "xls", "csv"])
+            
+            if f:
+                if 'sugestao_nome_pedido' not in st.session_state:
+                    st.session_state['sugestao_nome_pedido'] = f"PED-{datetime.now().strftime('%H%M%S')}"
+                
+                df = ler_planilha_simples(f)
+                if df is not None:
+                    st.dataframe(df.head(3), use_container_width=True)
+                    colunas = df.columns.tolist()
+                    
+                    st.divider()
+                    with st.form("map_form"):
+                        c1, c2 = st.columns(2)
+                        num_ped = c1.text_input("Número Pedido", value=st.session_state['sugestao_nome_pedido'])
+                        dt_ped = c2.date_input("Data", datetime.now())
+                        
+                        st.markdown("**Mapeamento:**")
+                        
+                        # --- LINHA 1: DEFINIÇÃO DO ID ÚNICO ---
+                        st.info("💡 **ID Único:** Escolha uma coluna que identifique cada linha (ex: Lote, ID). Se não tiver, use 'Automático (Linha do Excel)' para considerar a ordem das linhas.")
+                        # Opção padrão é Automático
+                        opcoes_id = ["(Automático: Usar Nº da Linha do Excel)"] + colunas
+                        col_id_unico = st.selectbox("Coluna ID Único (Opcional)", opcoes_id)
+                        
+                        st.markdown("---")
+                        
+                        # --- LINHA 2: DADOS DO ITEM ---
+                        cc1, cc2, cc3, cc4 = st.columns(4)
+                        col_cod = cc1.selectbox("Cód *", ["(Selecione)"] + colunas)
+                        col_desc = cc2.selectbox("Desc *", ["(Selecione)"] + colunas)
+                        col_qtd = cc3.selectbox("Qtd *", ["(Selecione)"] + colunas)
+                        col_und = cc4.selectbox("Und", ["(Padrão: UN)"] + colunas)
+                        
+                        if st.form_submit_button("🚀 Processar"):
+                            if "(Selecione)" in [col_cod, col_desc, col_qtd]:
+                                st.error("Campos obrigatórios vazios.")
+                            else:
+                                itens_processados = []
+                                
+                                # Iterar pelo Excel e criar IDs
+                                for index, row in df.iterrows():
+                                    try:
+                                        cod = str(row[col_cod]).strip()
+                                        qtd = float(str(row[col_qtd]).replace(',', '.'))
+                                        desc = str(row[col_desc]).strip()
+                                        und = "UN" if col_und == "(Padrão: UN)" else str(row[col_und]).strip()
+                                        
+                                        # LÓGICA DO ID ÚNICO
+                                        if col_id_unico == "(Automático: Usar Nº da Linha do Excel)":
+                                            # Gera ID baseado na linha: PEDIDO-LINHA-1
+                                            # Usamos o numero do pedido junto para garantir unicidade global se necessario, 
+                                            # mas aqui o foco é dentro do pedido.
+                                            # Index começa em 0, então linha 1 é index 0.
+                                            # Formato: "LINHA_{index}"
+                                            meu_id = f"LINHA_{index+1}" 
+                                        else:
+                                            # Usa a coluna que o usuário escolheu
+                                            meu_id = str(row[col_id_unico]).strip()
+                                        
+                                        if cod and cod.lower() not in ['nan', ''] and qtd > 0:
+                                            itens_processados.append({
+                                                "id_importacao": meu_id, # Chave principal agora!
+                                                "codigo": cod, 
+                                                "descricao": desc, 
+                                                "unidade": und, 
+                                                "qtd_solicitada": qtd
+                                            })
+                                    except: continue
+
+                                ped_existente = s.query(Pedido).filter_by(numero_pedido=num_ped).first()
+                                
+                                if not ped_existente:
+                                    # Criação Limpa
+                                    novo_ped = Pedido(numero_pedido=num_ped, data_pedido=dt_ped.strftime("%d/%m/%Y"), status="VALIDACAO")
+                                    s.add(novo_ped); s.flush()
+                                    for i in itens_processados:
+                                        s.add(ItemPedido(pedido_id=novo_ped.id, **i))
+                                    s.commit()
+                                    st.success(f"Pedido criado com {len(itens_processados)} itens.")
+                                    del st.session_state['sugestao_nome_pedido']
+                                    time.sleep(1); st.rerun()
+                                else:
+                                    # LÓGICA DE COMPARAÇÃO POR ID ÚNICO (Muito mais precisa)
+                                    
+                                    # Dicionário do banco: { ID_IMPORTACAO : Objeto Item }
+                                    # Se id_importacao for None (pedidos antigos), ignoramos ou tratamos como novos.
+                                    itens_banco_map = {i.id_importacao: i for i in ped_existente.itens if i.id_importacao}
+                                    
+                                    novos = []
+                                    atualizados = []
+                                    
+                                    for item_excel in itens_processados:
+                                        chave = item_excel['id_importacao']
+                                        
+                                        if chave in itens_banco_map:
+                                            # Item já existe no banco com esse ID (seja Lote ou Linha)
+                                            item_banco = itens_banco_map[chave]
+                                            
+                                            # Verifica se houve mudança na quantidade
+                                            if abs(item_excel['qtd_solicitada'] - item_banco.qtd_solicitada) > 0.001:
+                                                item_excel['qtd_antiga'] = item_banco.qtd_solicitada
+                                                item_excel['qtd_nova'] = item_excel['qtd_solicitada']
+                                                atualizados.append(item_excel)
+                                        else:
+                                            # ID não existe no banco -> É Novo
+                                            novos.append(item_excel)
+                                    
+                                    if not novos and not atualizados:
+                                        st.warning("Nenhuma alteração detectada (IDs e Quantidades idênticos).")
+                                    else:
+                                        st.session_state['merge_data'] = {'novos': novos, 'atualizados': atualizados}
+                                        st.session_state['merge_ped_num'] = num_ped
+                                        st.rerun()
+
+    # --- ABA 2: VALIDAÇÃO ---
     with t2:
         validacoes = s.query(Pedido).filter(Pedido.status == 'VALIDACAO').all()
         if not validacoes: st.caption("Vazio.")
         else:
             pid = st.selectbox("Limpar:", [p.id for p in validacoes], format_func=lambda x: next((f"{p.numero_pedido}" for p in validacoes if p.id==x), x))
             pval = s.query(Pedido).get(pid)
-            dval = pd.DataFrame([{"ID": i.id, "Código": i.codigo, "Descrição": i.descricao, "Qtd": i.qtd_solicitada, "Manter?": True} for i in pval.itens])
-            edf = st.data_editor(dval, num_rows="dynamic", column_config={"ID": st.column_config.NumberColumn(disabled=True), "Manter?": st.column_config.CheckboxColumn(default=True)}, hide_index=True, key="ev")
+            
+            # Mostra o ID Importação na tabela para conferência
+            dval = pd.DataFrame([{
+                "ID": i.id, 
+                "ID Origem": i.id_importacao, # Mostra se é LINHA_X ou Lote
+                "Código": i.codigo, 
+                "Descrição": i.descricao, 
+                "Qtd": i.qtd_solicitada, 
+                "Manter?": True
+            } for i in pval.itens])
+            
+            edf = st.data_editor(dval, num_rows="dynamic", column_config={
+                "ID": st.column_config.NumberColumn(disabled=True),
+                "ID Origem": st.column_config.TextColumn(disabled=True),
+                "Manter?": st.column_config.CheckboxColumn(default=True)
+            }, hide_index=True, key="ev")
+            
             c1, c2 = st.columns(2)
             if c1.button("🗑️ Excluir"): s.delete(pval); s.commit(); st.rerun()
             if c2.button("🚀 Liberar p/ Produção"):
@@ -257,12 +422,18 @@ def adm_screen():
                 for index, row in edf.iterrows():
                     if row.get("Manter?", True):
                         rid = row.get("ID")
-                        if pd.isna(rid): s.add(ItemPedido(pedido_id=pval.id, codigo=str(row["Código"]), descricao=str(row["Descrição"]), unidade="UN", qtd_solicitada=float(row["Qtd"])))
-                        else: ids_manter.append(int(rid))
+                        if pd.isna(rid): 
+                            # Adicionado manualmente na grid
+                            s.add(ItemPedido(pedido_id=pval.id, codigo=str(row["Código"]), descricao=str(row["Descrição"]), unidade="UN", qtd_solicitada=float(row["Qtd"]), id_importacao="MANUAL"))
+                        else: 
+                            ids_manter.append(int(rid))
+                            if int(rid) in itens_banco:
+                                itens_banco[int(rid)].qtd_solicitada = float(row["Qtd"])
                 for db_id, db_item in itens_banco.items():
                     if db_id not in ids_manter: s.delete(db_item)
                 pval.status = "EM_ANDAMENTO"; s.commit(); st.success("Liberado!"); time.sleep(1); st.rerun()
 
+    # --- ABA 3: GESTÃO ---
     with t3:
         peds_ativos = s.query(Pedido).filter(Pedido.status == 'EM_ANDAMENTO').order_by(Pedido.id.desc()).all()
         peds_concluidos = s.query(Pedido).filter(Pedido.status == 'CONCLUIDO').order_by(Pedido.id.desc()).limit(5).all()
@@ -294,7 +465,7 @@ def adm_screen():
                          c1, c2, c3, c4 = st.columns([1, 2, 1, 1])
                          nc = c1.text_input("Cód"); nd = c2.text_input("Desc"); nq = c3.number_input("Qtd", min_value=0.1)
                          if c4.form_submit_button("Add") and nc:
-                             s.add(ItemPedido(pedido_id=ped.id, codigo=nc, descricao=nd, unidade="UN", qtd_solicitada=nq, item_adicionado_manualmente=True)); s.commit(); st.rerun()
+                             s.add(ItemPedido(pedido_id=ped.id, codigo=nc, descricao=nd, unidade="UN", qtd_solicitada=nq, item_adicionado_manualmente=True, id_importacao="MANUAL_EXTRA")); s.commit(); st.rerun()
 
             pendencias_lancamento = 0
             pendencias_separacao = 0
@@ -303,10 +474,13 @@ def adm_screen():
                 tot_sep = sum([sep.qtd_separada for sep in it.separacoes])
                 meta = it.qtd_solicitada
                 
-                if tot_sep == 0: style, icon = f"{it.codigo} {it.descricao}", "⬜"
-                elif tot_sep < meta: style, icon = f":orange[{it.codigo} {it.descricao}]", "⏳"
-                elif tot_sep == meta: style, icon = f":green[{it.codigo} {it.descricao}]", "✅"
-                else: style, icon = f":red[{it.codigo} {it.descricao}]", "🚫"
+                # Exibe o ID de Origem no card para ajudar a diferenciar lotes iguais
+                origem_txt = f"[{it.id_importacao}]" if it.id_importacao else ""
+                
+                if tot_sep == 0: style, icon = f"{it.codigo} {it.descricao} {origem_txt}", "⬜"
+                elif tot_sep < meta: style, icon = f":orange[{it.codigo} {it.descricao} {origem_txt}]", "⏳"
+                elif tot_sep == meta: style, icon = f":green[{it.codigo} {it.descricao} {origem_txt}]", "✅"
+                else: style, icon = f":red[{it.codigo} {it.descricao} {origem_txt}]", "🚫"
 
                 with st.expander(f"{icon} {style} ({tot_sep}/{meta})"):
                      if (tot_sep != meta) and ped.status != 'CONCLUIDO':
@@ -315,11 +489,10 @@ def adm_screen():
                      
                      if not it.separacoes: st.caption("Nada separado.")
                      
-                     # --- CABEÇALHO DA TABELA ADM ---
                      cols_h = st.columns([3, 1, 1, 2, 2, 1])
                      cols_h[0].markdown("**Rastreabilidade**")
                      cols_h[1].markdown("**Sep.**")
-                     cols_h[2].markdown("**Conf.**") # Nova coluna para ADM ver
+                     cols_h[2].markdown("**Conf.**") 
                      cols_h[3].markdown("**Status Conf.**")
                      cols_h[4].markdown("**ERP**")
 
@@ -328,11 +501,9 @@ def adm_screen():
                          c1.text(sep.rastreabilidade)
                          c2.text(sep.qtd_separada)
                          
-                         # --- COLUNA NOVA: MOSTRAR CONFERIDO ---
-                         # Se houver divergencia, pinta de vermelho
                          val_conf = sep.qtd_conferida if sep.qtd_conferida is not None else 0.0
                          if sep.conferido and (val_conf != sep.qtd_separada):
-                             c3.markdown(f":red[**{val_conf}**]") # Alerta visual
+                             c3.markdown(f":red[**{val_conf}**]")
                          else:
                              c3.text(val_conf if sep.conferido else "-")
                          
@@ -482,9 +653,9 @@ def op_screen():
                                                 st.success(f"Lido: {decoded_text}")
                                             else:
                                                 st.error("⚠️ Falha na leitura.")
-                                        
-                                        val_inicial = decoded_text if decoded_text else ""
-                                        nr = st.text_input("Rastreabilidade", value=val_inicial)
+                                            
+                                            val_inicial = decoded_text if decoded_text else ""
+                                            nr = st.text_input("Rastreabilidade", value=val_inicial)
                                     else:
                                         nr = st.text_input("Rastreabilidade", placeholder="Bipe aqui...")
 
@@ -509,7 +680,7 @@ def op_screen():
                 else:
                     if working: st.info("Adicione itens para enviar.")
 
-    # --- ABA CONFERÊNCIA (LÓGICA NOVA DE CONTAGEM) ---
+    # --- ABA CONFERÊNCIA ---
     if "📋 Conferência" in tabs:
         with ts[tabs.index("📋 Conferência")]:
             peds_conf = []
@@ -517,7 +688,6 @@ def op_screen():
             for p in raw_peds:
                 tem = False
                 for it in p.itens:
-                    # Pendente se: enviado pra conf E não conferido E não rejeitado
                     pendentes = [x for x in it.separacoes if x.enviado_conferencia and not x.conferido and not x.motivo_rejeicao]
                     if pendentes: tem = True; break
                 if tem: peds_conf.append(p)
@@ -533,7 +703,6 @@ def op_screen():
                     to_check = [x for x in it.separacoes if x.enviado_conferencia and not x.conferido and not x.motivo_rejeicao]
                     if to_check:
                         with st.expander(f"{it.codigo} {it.descricao} ({len(to_check)} lotes)", expanded=True):
-                            # Cabeçalho da tabela de conferência
                             c_h1, c_h2, c_h3, c_h4 = st.columns([3, 1, 2, 2])
                             c_h1.markdown("**Rastreabilidade**")
                             c_h2.markdown("**Qtd (Sep)**")
@@ -545,14 +714,11 @@ def op_screen():
                                 c1.text(sep.rastreabilidade)
                                 c2.text(sep.qtd_separada)
                                 
-                                # Input de Contagem
                                 key_in = f"in_conf_{sep.id}"
                                 val_contada = c3.number_input("Qtd", key=key_in, step=0.1, label_visibility="collapsed")
                                 
-                                # Botão de Ação
                                 if c4.button("Conferir", key=f"btn_check_{sep.id}"):
                                     if val_contada == sep.qtd_separada:
-                                        # Caso ideal: Bateu!
                                         sep.qtd_conferida = val_contada
                                         sep.conferido = True
                                         sep.data_conferencia = datetime.now()
@@ -561,10 +727,8 @@ def op_screen():
                                         time.sleep(0.5)
                                         st.rerun()
                                     else:
-                                        # Divergência: Salva no estado para mostrar alerta
                                         st.session_state[f"alert_div_{sep.id}"] = True
                                 
-                                # Se houver alerta de divergência no estado
                                 if st.session_state.get(f"alert_div_{sep.id}"):
                                     st.warning(f"⚠️ DIVERGÊNCIA! Separado: {sep.qtd_separada} | Contado: {val_contada}")
                                     cola, colb = st.columns(2)
@@ -572,17 +736,15 @@ def op_screen():
                                         sep.qtd_conferida = val_contada
                                         sep.conferido = True
                                         sep.data_conferencia = datetime.now()
-                                        del st.session_state[f"alert_div_{sep.id}"] # Limpa alerta
-                                        s.commit()
-                                        st.rerun()
+                                        del st.session_state[f"alert_div_{sep.id}"]
+                                        s.commit(); st.rerun()
                                     
                                     if colb.button("Recusar/Devolver", key=f"reject_{sep.id}"):
                                         sep.motivo_rejeicao = f"Divergência de Qtd (Sep: {sep.qtd_separada} vs Conf: {val_contada})"
                                         sep.enviado_conferencia = False
                                         sep.conferido = False
-                                        del st.session_state[f"alert_div_{sep.id}"] # Limpa alerta
-                                        s.commit()
-                                        st.rerun()
+                                        del st.session_state[f"alert_div_{sep.id}"]
+                                        s.commit(); st.rerun()
 
                                 count_pend += 1
                 if count_pend == 0: st.success("Tudo conferido!")
